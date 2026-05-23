@@ -1,5 +1,6 @@
 import asyncio
 import aiohttp
+from aiohttp import web
 import os
 import json
 import logging
@@ -33,7 +34,7 @@ last_known_fills = {}
 bot_running = True
 monitoring_paused = False
 
-# Глобальная HTTP-сессия (будет создана при старте)
+# Глобальная HTTP-сессия
 http_session: aiohttp.ClientSession = None
 
 # ======================== КЛАВИАТУРА ========================
@@ -55,7 +56,6 @@ def load_wallets() -> dict:
     try:
         with open(WALLETS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-            # Поддержка старого формата
             if isinstance(data.get("wallets"), list):
                 return {w: "" for w in data["wallets"]}
             return data.get("wallets", {})
@@ -216,7 +216,6 @@ def format_fill_msg(fill: dict, address: str, label: str = "") -> str:
         emoji = "💚" if pnl >= 0 else "💔"
         pnl_line = f"\n{emoji} PnL: <b>{pnl:+.2f}$</b>"
 
-    # Статистика трейдера
     stats = load_stats().get(address.lower(), {})
     stat_block = ""
     if stats:
@@ -362,7 +361,6 @@ async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text("❌ Адрес не найден.", reply_markup=main_keyboard())
     else:
-        # Выбор из списка inline-кнопками
         buttons = []
         for a, l in wallets.items():
             display = f"❌ {l} {short_addr(a)}" if l else f"❌ {short_addr(a)}"
@@ -560,6 +558,20 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+# ================== ВЕБ-СЕРВЕР ДЛЯ RENDER ===================
+async def handle_health(request):
+    return web.Response(text="OK")
+
+async def run_web_server():
+    port = int(os.getenv("PORT", 10000))
+    app = web.Application()
+    app.router.add_get("/", handle_health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    log.info(f"Веб-сервер запущен на порту {port}")
+
 # ==================== ЗАПУСК ================================
 async def main():
     global http_session, last_known_fills
@@ -567,22 +579,32 @@ async def main():
         log.error("❌ TELEGRAM_TOKEN или CHAT_ID не заданы в .env")
         return
 
-    http_session = aiohttp.ClientSession()
+    timeout = aiohttp.ClientTimeout(total=60, connect=30)
+    http_session = aiohttp.ClientSession(timeout=timeout)
     last_known_fills = load_fills_state()
     log.info(f"Загружено состояние fills для {len(last_known_fills)} кошельков")
 
     app = Application.builder().token(TOKEN).build()
-    await app.bot.set_my_commands([
-        BotCommand("start", "Главное меню"),
-        BotCommand("add", "Добавить кошелёк"),
-        BotCommand("remove", "Удалить кошелёк"),
-        BotCommand("list", "Список кошельков"),
-        BotCommand("status", "Открытые позиции"),
-        BotCommand("stats", "Статистика сделок"),
-        BotCommand("pause", "Пауза мониторинга"),
-        BotCommand("resume", "Возобновить мониторинг"),
-        BotCommand("help", "Помощь"),
-    ])
+    for attempt in range(5):
+        try:
+            await app.bot.set_my_commands([
+                BotCommand("start", "Главное меню"),
+                BotCommand("add", "Добавить кошелёк"),
+                BotCommand("remove", "Удалить кошелёк"),
+                BotCommand("list", "Список кошельков"),
+                BotCommand("status", "Открытые позиции"),
+                BotCommand("stats", "Статистика сделок"),
+                BotCommand("pause", "Пауза мониторинга"),
+                BotCommand("resume", "Возобновить мониторинг"),
+                BotCommand("help", "Помощь"),
+            ])
+            break
+        except Exception as e:
+            log.warning(f"Попытка {attempt+1}: {e}")
+            await asyncio.sleep(5)
+    else:
+        log.error("Не удалось подключиться к Telegram API")
+        return
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("add", cmd_add))
@@ -600,9 +622,10 @@ async def main():
     await app.start()
     poll = asyncio.create_task(app.updater.start_polling(drop_pending_updates=True))
     monitor = asyncio.create_task(monitoring_loop(app.bot))
+    web_task = asyncio.create_task(run_web_server())
 
     log.info("✅ Бот запущен и мониторит кошельки.")
-    await asyncio.gather(poll, monitor)
+    await asyncio.gather(poll, monitor, web_task)
 
 if __name__ == "__main__":
     try:
