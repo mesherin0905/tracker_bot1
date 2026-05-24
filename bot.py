@@ -5,6 +5,8 @@ import json
 import logging
 from datetime import datetime
 from dotenv import load_dotenv
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
 from telegram import (
     Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup,
     ReplyKeyboardMarkup, BotCommand
@@ -33,6 +35,26 @@ last_known_fills = {}
 bot_running = True
 monitoring_paused = False
 http_session: aiohttp.ClientSession = None
+
+# ======================== ВЕБ-СЕРВЕР ДЛЯ RENDER ========================
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
+
+    def log_message(self, format, *args):
+        pass  # отключаем лишние логи
+
+def start_web_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    log.info(f"Веб-сервер запущен на порту {port}")
+    server.serve_forever()
 
 # ======================== КЛАВИАТУРА ========================
 def main_keyboard():
@@ -332,7 +354,6 @@ async def check_address(bot: Bot, address: str, label: str = ""):
             if fid not in known:
                 new_fills.append((fid, fill))
 
-        # Максимум 10 новых сделок за раз — защита от спама
         for fid, fill in new_fills[:10]:
             try:
                 if not should_notify(fill):
@@ -637,7 +658,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text(txt, parse_mode='HTML')
         except Exception as e:
             log.error(f"Ошибка загрузки позиций: {e}")
-            await query.message.reply_text("⚠️ Ошибка загрузки позиций.")
+                        await query.message.reply_text("⚠️ Ошибка загрузки позиций.")
         return
 
     if data.startswith("stat_"):
@@ -653,7 +674,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(
             f"📈 <b>{label} {short_addr(addr)}</b>\n"
             f"Сделок: {total} | Винрейт: {wr:.1f}%\n"
-                        f"PnL: {s['total_pnl']:+.2f}$ | Объём: ${s['total_volume']:,.2f}\n"
+            f"PnL: {s['total_pnl']:+.2f}$ | Объём: ${s['total_volume']:,.2f}\n"
             f"Лучшая: +${s['best_trade']:,.2f} | Худшая: ${s['worst_trade']:,.2f}",
             parse_mode='HTML'
         )
@@ -666,6 +687,10 @@ async def main():
     if not TOKEN or not CHAT_ID:
         log.error("❌ TELEGRAM_TOKEN или ADMIN_ID не заданы в .env")
         return
+
+    # ✅ Запускаем веб-сервер в отдельном потоке
+    web_thread = threading.Thread(target=start_web_server, daemon=True)
+    web_thread.start()
 
     http_session = aiohttp.ClientSession()
     last_known_fills = load_fills_state()
@@ -705,7 +730,6 @@ async def main():
     )
     monitor = asyncio.create_task(monitoring_loop(app.bot))
 
-    # ✅ Колбэк на случай падения задач
     def handle_task_exception(task: asyncio.Task):
         try:
             task.result()
@@ -719,7 +743,6 @@ async def main():
 
     log.info("✅ Бот запущен!")
 
-    # ✅ Основной цикл — следит за задачами и перезапускает мониторинг
     try:
         while True:
             await asyncio.sleep(60)
